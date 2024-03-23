@@ -1,0 +1,13 @@
+ARG VARIANT=latest
+FROM mcr.microsoft.com/devcontainers/go:${VARIANT}
+
+USER root
+
+RUN mkdir --parents /go/pkg/mod/ && \
+    chmod -R 775 /go
+
+USER vscode
+
+RUN git config --global http.proxy 172.17.0.1:3128 && \
+    git config --global https.proxy 172.17.0.1:3128
+    
