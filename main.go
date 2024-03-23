@@ -19,41 +19,36 @@ import (
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 )
 
+type Project struct {
+	Id     int    `json:"id"`
+	Sender string `json:"sender" binding:"required"`
+	Method string `json:"method" binding:"required"`
+	Onb    string `json:"onb" binding:"required"`
+	PrjNum string `json:"prj_num"`
+	Status string `json:"transfer_status" binding:"required"`
+}
+
+type NotificationPayload struct {
+	Timestamp time.Time `json:"timestemp"`
+	Action    string    `json:"action"`
+	Schema    string    `json:"schema"`
+	Identity  string    `json:"identity"`
+	New       Project   `json:"new"`
+	Old       Project   `json:"old"`
+}
+
 var pool *pgxpool.Pool
 var riverClient *river.Client[pgx.Tx]
 
 const DATABASE_DSN string = "application_name=Tests user=postgres password=postgres host=postgres dbname=postgres"
 
-func callWithTransaction(pool *pgxpool.Pool, timeout time.Duration, fn func(pgx.Tx, context.Context) error) error {
-	var err error
-
-	// Start a transaction and handle the closing
-	tx, err := pool.Begin(context.TODO())
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err != nil {
-			tx.Rollback(context.TODO())
-		} else {
-			tx.Commit(context.TODO())
-		}
-	}()
-
-	transactionCtx, transactionCtxCancel := context.WithTimeout(context.Background(), timeout)
-	defer transactionCtxCancel()
-
-	err = fn(tx, transactionCtx) // Make sure to set err so the rollback/commit works
-	return err
-}
-
 func createProjectsTable(tx pgx.Tx, ctx context.Context) error {
-	_, err := tx.Exec(context.TODO(), `CREATE SEQUENCE IF NOT EXISTS "Projects_id_seq";`)
+	_, err := tx.Exec(ctx, `CREATE SEQUENCE IF NOT EXISTS "Projects_id_seq";`)
 	if err != nil {
 		return err
 	}
 
-	_, err = tx.Exec(context.TODO(), `
+	_, err = tx.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS "Projects" (
 			"id" integer DEFAULT nextval('"Projects_id_seq"') NOT NULL,
 			"sender" text DEFAULT 'IS-SYSTEM' NOT NULL,
@@ -68,7 +63,7 @@ func createProjectsTable(tx pgx.Tx, ctx context.Context) error {
 }
 
 func createProjectsNotification(tx pgx.Tx, ctx context.Context) error {
-	_, err := tx.Exec(context.TODO(), `
+	_, err := tx.Exec(ctx, `
 		CREATE OR REPLACE FUNCTION prj_notify() RETURNS trigger AS $trigger$
 		DECLARE
 		rec RECORD;
@@ -111,7 +106,7 @@ func createProjectsNotification(tx pgx.Tx, ctx context.Context) error {
 		return err
 	}
 
-	_, err = tx.Exec(context.TODO(), `
+	_, err = tx.Exec(ctx, `
 		CREATE OR REPLACE TRIGGER projects_notify
 		AFTER INSERT OR UPDATE OR DELETE ON "Projects" FOR EACH ROW
 		EXECUTE PROCEDURE prj_notify();`)
@@ -125,26 +120,29 @@ func createProjectsNotification(tx pgx.Tx, ctx context.Context) error {
 }
 
 func setupDB(pool *pgxpool.Pool) error {
-	err := callWithTransaction(pool, time.Second*5, createProjectsTable)
+	var err error
+
+	// Start a transaction and handle the closing
+	tx, err := pool.Begin(context.TODO())
 	if err != nil {
-		return fmt.Errorf("unable to create projects table: %w", err)
+		return err
 	}
 
-	err = callWithTransaction(pool, time.Second*5, createProjectsNotification)
+	transactionCtx, transactionCtxCancel := context.WithTimeout(context.Background(), time.Second*15)
+	defer transactionCtxCancel()
+
+	err = createProjectsTable(tx, transactionCtx)
 	if err != nil {
-		return fmt.Errorf("unable to create notifier for projects: %w", err)
+		tx.Rollback(context.TODO())
+		return err
+	}
+	err = createProjectsNotification(tx, transactionCtx)
+	if err != nil {
+		tx.Rollback(context.TODO())
+		return err
 	}
 
-	return nil
-}
-
-type Project struct {
-	Id     int    `json:"id"`
-	Sender string `json:"sender" binding:"required"`
-	Method string `json:"method" binding:"required"`
-	Onb    string `json:"onb" binding:"required"`
-	PrjNum string `json:"prj_num"`
-	Status string `json:"transfer_status" binding:"required"`
+	return tx.Commit(context.TODO())
 }
 
 func getData(c *gin.Context) {
@@ -214,16 +212,7 @@ func postData(c *gin.Context) {
 	c.Status(http.StatusOK)
 }
 
-type NotificationPayload struct {
-	Timestamp time.Time `json:"timestemp"`
-	Action    string    `json:"action"`
-	Schema    string    `json:"schema"`
-	Identity  string    `json:"identity"`
-	New       Project   `json:"new"`
-	Old       Project   `json:"old"`
-}
-
-func HandleProjectsNotification(ctx context.Context, notification *pgconn.Notification, conn *pgx.Conn) error {
+func handleProjectsNotification(ctx context.Context, notification *pgconn.Notification, conn *pgx.Conn) error {
 	fmt.Printf("%s - %d - %s", notification.Channel, notification.PID, notification.Payload)
 
 	var payload NotificationPayload
@@ -313,10 +302,7 @@ func main() {
 		},
 	}
 
-	listener.Handle("projects", pgxlisten.HandlerFunc(HandleProjectsNotification))
-
-	listenerCtx, listenerCtxCancel := context.WithCancel(context.TODO())
-	defer listenerCtxCancel()
+	listener.Handle("projects", pgxlisten.HandlerFunc(handleProjectsNotification))
 
 	// Server
 
@@ -349,7 +335,6 @@ func main() {
 
 	// This go-routine waits for the shutdown signal (from /stop) and stops the http server, which then unblocks and ends the program gracefully.
 	go func() {
-		// Wait for the server to stop
 		<-serverShutdownChan
 		fmt.Println("Starting shutdown routine")
 
@@ -369,6 +354,8 @@ func main() {
 	}()
 
 	// Start the listener
+	listenerCtx, listenerCtxCancel := context.WithCancel(context.Background())
+	defer listenerCtxCancel()
 	go listener.Listen(listenerCtx)
 
 	// Start the webserver
@@ -378,10 +365,11 @@ func main() {
 	}
 
 	// Shutdown routine
+
+	fmt.Println("Stopping queue")
 	riverTimeoutCtx, riverTimeoutCtxCancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer riverTimeoutCtxCancel()
 
-	fmt.Println("Stopping queue")
 	err = riverClient.Stop(riverTimeoutCtx)
 	fmt.Printf("Queue stopped: %v\n", err)
 
