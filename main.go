@@ -23,7 +23,7 @@ type Project struct {
 	Id     int    `json:"id"`
 	Sender string `json:"sender" binding:"required"`
 	Method string `json:"method" binding:"required"`
-	Onb    string `json:"onb" binding:"required"`
+	Onb    int    `json:"onb" binding:"required"`
 	PrjNum string `json:"prj_num"`
 	Status string `json:"transfer_status" binding:"required"`
 }
@@ -235,7 +235,7 @@ type TestWorker struct {
 }
 
 func (w *TestWorker) Work(ctx context.Context, job *river.Job[QueueTestArgs]) error {
-	fmt.Println("Started working on", job.Args.Onb)
+	fmt.Println("Started working on", job.ID)
 	// if err != nil {
 	// 	c.String(http.StatusBadRequest, err.Error())
 	// }
